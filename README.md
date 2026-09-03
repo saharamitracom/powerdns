@@ -1,89 +1,195 @@
-# Panduan Instalasi PowerDNS (Master-Slave) & Poweradmin - Debian 13
+# PowerDNS (Primary–Secondary) + Poweradmin — Debian 13
 
-Dokumentasi ini panduan penggunaan script otomasi untuk membangun infrastruktur DNS Server menggunakan PowerDNS dengan topologi Primary-Secondary (Master-Slave) beserta web panel Poweradmin di lingkungan operasi Debian 13.
+Script otomasi untuk membangun DNS authoritative dengan topologi Primary–Secondary
+menggunakan PowerDNS, ditambah web panel Poweradmin di server primary.
 
-## Persyaratan Sistem
+| File | Peran | Dijalankan di |
+|---|---|---|
+| `install_ns1.sh` | PowerDNS Primary + MariaDB + Apache + Poweradmin + TLS | Server NS1 |
+| `install_ns2.sh` | PowerDNS Secondary (autosecondary) + MariaDB | Server NS2 |
 
-* 2 buah server/Virtual Private Server (VPS) dengan OS Debian 13 (direkomendasikan instalasi baru/fresh install).
-* Akses `root` pada kedua server.
-* IP Publik statis pada masing-masing server.
-* Port 53 (TCP/UDP) dan Port 80 (TCP) terbuka di sisi provider VPS.
+Kedua script mengumpulkan seluruh input di awal, menampilkan ringkasan, lalu
+berjalan sampai selesai tanpa interupsi.
 
 ---
 
-## 1. Persiapan Primary Server (NS1)
+## Persyaratan
 
-Server pertama bertindak sebagai Master DNS. Semua manajemen domain (zona) dilakukan di server ini melalui antarmuka web Poweradmin.
+- 2 server / VPS dengan Debian 13 (trixie) atau Debian 12 (bookworm), sebaiknya fresh install.
+- Akses `root` di kedua server.
+- IP publik statis di masing-masing server.
+- Di firewall provider: port **53 TCP+UDP** dan **80 + 443 TCP** terbuka.
+- Untuk TLS otomatis: A record hostname panel (mis. `dns.domainanda.com`) sudah
+  mengarah ke IP NS1 **sebelum** script dijalankan. Kalau belum, script melewati
+  langkah TLS dan mencetak perintah certbot yang bisa dijalankan menyusul.
 
-### Langkah Instalasi:
-1. Login ke server Primary menggunakan SSH sebagai `root`.
-2. Buat file eksekusi baru:
-   ```bash
-   nano install_ns1.sh
-Tempelkan seluruh kode script NS1.
+Port SSH dideteksi otomatis dari `sshd_config` dan diizinkan **sebelum** UFW
+diaktifkan, jadi sesi SSH tidak akan terputus.
 
-Penting: Ubah variabel NS2_IP di bagian atas script dengan IP Publik server Secondary.
+---
 
-Simpan file dan berikan hak akses eksekusi:
+## 1. Server Primary (NS1)
 
-Bash
+```bash
+scp install_ns1.sh root@IP_NS1:/root/
+ssh root@IP_NS1
 chmod +x install_ns1.sh
-Jalankan instalasi:
-
-Bash
 ./install_ns1.sh
-Catat informasi nama database, user, dan password yang muncul pada akhir proses eksekusi.
+```
 
-Penyelesaian via Web (Poweradmin):
-Buka web browser dan akses URL: http://<IP_Server_NS1>/poweradmin/install/
+### Input yang ditanyakan
 
-Masukkan informasi kredensial database yang dicatat sebelumnya.
+| # | Pertanyaan | Default |
+|---|---|---|
+| 1 | Domain utama | — |
+| 2 | Hostname NS1 | `ns1.<domain>` |
+| 3 | IP publik NS1 | dideteksi otomatis dari interface |
+| 4 | Hostname NS2 | `ns2.<domain>` |
+| 5 | IP publik NS2 | — |
+| 6 | Email hostmaster | `hostmaster@<domain>` |
+| 7 | Hostname panel Poweradmin | `dns.<domain>` |
+| 8 | Konfirmasi ringkasan | `N` |
 
-Tentukan password untuk login administrator Poweradmin (admin).
+Tidak ditanyakan karena di-generate atau dideteksi sendiri: nama & user database,
+password database (28 karakter acak), port SSH, lokasi `schema.mysql.sql`,
+versi rilis Poweradmin.
 
-Setelah instalasi web selesai, wajib hapus direktori instalasi untuk keamanan:
+Override lewat environment bila perlu: `DB_NAME`, `DB_USER`.
 
-Bash
-rm -rf /var/www/html/poweradmin/install/
-2. Persiapan Secondary Server (NS2)
-Server kedua bertindak sebagai Slave DNS. Server ini pasif dan hanya menunggu pembaruan (AXFR zone transfer) dari Master DNS secara otomatis. Tidak ada antarmuka web di server ini.
+### Yang dilakukan script
 
-Langkah Instalasi:
-Login ke server Secondary menggunakan SSH sebagai root.
+- Memasang MariaDB, Apache, PHP (termasuk `php-intl`), PowerDNS, Poweradmin.
+- Menonaktifkan `systemd-resolved` **sebelum** PowerDNS dipasang agar port 53 bebas.
+- Import skema PowerDNS (lokasi file dicari lewat `dpkg -L`) lalu memverifikasi tabel `domains`.
+- Menulis konfigurasi ke `/etc/powerdns/pdns.d/` sebagai file terpisah, mode 640 `root:pdns`.
+- Menyetel `default-soa-content` dari hostname NS1 + email hostmaster, sehingga zona
+  baru yang dibuat lewat Poweradmin langsung punya SOA yang benar.
+- Membuat zona domain utama beserta record:
 
-Buat file eksekusi baru:
+  ```
+  SOA  <domain>       ns1.<domain> hostmaster.<domain> <serial> 10800 3600 604800 3600
+  NS   <domain>       ns1.<domain>
+  NS   <domain>       ns2.<domain>
+  A    ns1.<domain>   <IP NS1>
+  A    ns2.<domain>   <IP NS2>
+  A    dns.<domain>   <IP NS1>
+  ```
 
-Bash
-nano install_ns2.sh
-Tempelkan seluruh kode script NS2.
+- Memasang Poweradmin dari tag rilis terbaru sebagai **DocumentRoot** vhost sendiri
+  (bukan subfolder) — Poweradmin v4 memakai routing Symfony + `.htaccess`, jadi butuh
+  `AllowOverride All` dan `mod_rewrite`.
+- Menjalankan certbot untuk hostname panel dan mengaktifkan redirect ke HTTPS.
+- Mengaktifkan UFW: SSH, 80, 443, 53/tcp, 53/udp.
 
-Penting: Ubah variabel di bagian atas script:
+### Keluaran
 
-MASTER_IP: Isi dengan IP Publik server Primary (NS1).
+| Berkas | Isi |
+|---|---|
+| `/root/powerdns-ns1-credentials.txt` | Kredensial database dan ringkasan konfigurasi (mode 600) |
+| `/root/ns2-setup.env` | `MASTER_IP` dan `MASTER_NS` siap pakai untuk NS2 |
+| `/var/log/install_ns1.log` | Log lengkap instalasi |
 
-MASTER_NS: Isi dengan hostname untuk NS1 (misal: ns1.domainanda.com).
+### Menyelesaikan Poweradmin
 
-Simpan file dan berikan hak akses eksekusi:
+1. Buka `https://dns.<domain>/install/`
+2. Isi kredensial database dari `/root/powerdns-ns1-credentials.txt`
+3. Tentukan password admin Poweradmin
+4. Setelah selesai, **wajib**:
 
-Bash
+   ```bash
+   rm -rf /var/www/poweradmin/install
+   chmod 640 /var/www/poweradmin/config/settings.php
+   ```
+
+---
+
+## 2. Server Secondary (NS2)
+
+Cara termudah — pakai berkas jawaban yang dihasilkan NS1, sehingga hostname primary
+mustahil salah ketik:
+
+```bash
+scp /root/ns2-setup.env root@IP_NS2:/root/
+scp install_ns2.sh      root@IP_NS2:/root/
+ssh root@IP_NS2
 chmod +x install_ns2.sh
-Jalankan instalasi:
+./install_ns2.sh --env /root/ns2-setup.env      # jalan tanpa tanya apa-apa
+```
 
-Bash
+Atau interaktif:
+
+```bash
 ./install_ns2.sh
-3. Pengujian Sinkronisasi Zone Transfer
-Verifikasi apakah arsitektur Master-Slave sudah berjalan dengan normal dan NS2 menerima data dari NS1.
+#   IP publik NS1  : 203.0.113.10
+#   Hostname NS1   : ns1.domainanda.com
+```
 
-Buka web panel Poweradmin di NS1.
+> **`MASTER_NS` harus sama persis dengan record NS di zona pada NS1.** Autosecondary
+> mencocokkan nama server pada paket NOTIFY dengan tabel `supermasters`; kalau tidak
+> cocok, zona tidak akan pernah dibuat otomatis. Inilah penyebab "AXFR tidak jalan"
+> yang paling sering.
 
-Tambahkan Master Zone baru (misal: domain-testing.com).
+Argumen: `--env FILE` (baca `MASTER_IP`/`MASTER_NS`), `-y` (lewati konfirmasi).
 
-Tambahkan beberapa record (A, CNAME, atau TXT) di dalam zona tersebut.
+---
 
-Login ke terminal server NS2.
+## 3. Verifikasi Zone Transfer
 
-Periksa log layanan PowerDNS secara real-time:
+1. Di Poweradmin (NS1), tambahkan **Master Zone** baru, mis. `domain-testing.com`,
+   lengkap dengan record NS `ns1.<domain>` dan `ns2.<domain>`.
+2. Di NS2, pantau log:
 
-Bash
-journalctl -u pdns -f
-Jika konfigurasi sukses, log NS2 akan menampilkan status bahwa server menerima notifikasi (received NOTIFY) dan berhasil menyelesaikan proses transfer zona (AXFR started, AXFR done).
+   ```bash
+   journalctl -u pdns -f
+   ```
+
+   Yang diharapkan: `received NOTIFY`, lalu `AXFR started` dan `AXFR done`.
+3. Bandingkan serial di kedua server:
+
+   ```bash
+   dig @IP_NS1 domain-testing.com SOA +short
+   dig @IP_NS2 domain-testing.com SOA +short
+   ```
+
+Jika NOTIFY tidak masuk:
+
+```bash
+# di NS1
+grep -r allow-axfr-ips /etc/powerdns/          # harus memuat IP NS2
+pdns_control notify domain-testing.com         # picu NOTIFY manual
+# di NS2
+mysql powerdns_slave -e "SELECT * FROM supermasters;"
+mysql powerdns_slave -e "SELECT name,type,master FROM domains;"
+```
+
+4. Terakhir, daftarkan glue record `ns1.<domain>` dan `ns2.<domain>` di registrar domain.
+
+---
+
+## Ringkasan konfigurasi
+
+| Aspek | NS1 | NS2 |
+|---|---|---|
+| Backend | `gmysql`, DNSSEC aktif | `gmysql`, DNSSEC aktif |
+| Peran | `primary=yes` | `secondary=yes`, `autosecondary=yes` |
+| Kontrol transfer | `allow-axfr-ips`, `also-notify`, `only-notify` | `allow-notify-from=<NS1>/32`, `disable-axfr=yes` |
+| SOA default | `default-soa-content` dari input wizard | — |
+| File konfigurasi | `/etc/powerdns/pdns.d/pdns.local.*.conf` (640, `root:pdns`) | idem |
+| `systemd-resolved` | dimatikan sebelum pdns dipasang | idem |
+| Firewall | SSH, 80, 443, 53/tcp, 53/udp | SSH, 53/tcp, 53/udp |
+
+Konfigurasi ditulis sebagai file terpisah di `pdns.d/`, bukan di-append ke `pdns.conf`,
+sehingga script aman dijalankan ulang tanpa menghasilkan parameter ganda.
+
+---
+
+## Rollback
+
+```bash
+systemctl stop pdns apache2
+apt-get purge -y pdns-server pdns-backend-mysql
+mysql -e "DROP DATABASE powerdns; DROP USER 'powerdns_user'@'localhost';"
+rm -rf /var/www/poweradmin /etc/powerdns/pdns.d/pdns.local.*
+rm -f /etc/apache2/sites-enabled/poweradmin.conf
+systemctl enable --now systemd-resolved
+```
