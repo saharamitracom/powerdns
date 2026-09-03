@@ -1,13 +1,22 @@
 #!/bin/bash
 if [ "$EUID" -ne 0 ]; then echo "Jalankan sebagai root"; exit 1; fi
 
-# === UBAH VARIABEL INI ===
-NS2_IP="111.222.333.444" # IP Server Secondary
+clear
+echo "=============================================="
+echo " INSTALASI POWERDNS PRIMARY (NS1) & POWERADMIN"
+echo "=============================================="
+read -p "Masukkan IP Publik Server Secondary (NS2): " NS2_IP
+
+# Validasi format IP
+if [[ ! $NS2_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "Error: Format IP tidak valid!"
+    exit 1
+fi
+
 DB_NAME="powerdns"
 DB_USER="powerdns_user"
 DB_PASS="P@ss_Primary_$(date +%s)"
 WEB_DIR="/var/www/html/poweradmin"
-# =========================
 
 apt update && apt upgrade -y
 apt install -y mariadb-server apache2 php libapache2-mod-php php-mysql php-xml php-mbstring php-curl gettext git unzip curl ufw
@@ -35,6 +44,8 @@ gmysql-dnssec=yes
 EOF
 
 cat <<EOF >> /etc/powerdns/pdns.conf
+
+# Konfigurasi NS Primary
 primary=yes
 allow-axfr-ips=$NS2_IP
 also-notify=$NS2_IP
@@ -56,6 +67,9 @@ ufw allow 53/tcp
 ufw allow 53/udp
 ufw --force enable
 
-echo -e "\n=== NS1 SELESAI ==="
+echo -e "\n=============================================="
+echo " INSTALASI NS1 SELESAI"
+echo "=============================================="
 echo "Database: $DB_NAME | User: $DB_USER | Pass: $DB_PASS"
 echo "Buka: http://$(hostname -I | awk '{print $1}')/poweradmin/install/"
+echo "=============================================="
