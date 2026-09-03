@@ -1,4 +1,3 @@
-Markdown
 # Panduan Instalasi PowerDNS (Master-Slave) & Poweradmin - Debian 13
 
 Dokumentasi ini panduan penggunaan script otomasi untuk membangun infrastruktur DNS Server menggunakan PowerDNS dengan topologi Primary-Secondary (Master-Slave) beserta web panel Poweradmin di lingkungan operasi Debian 13.
