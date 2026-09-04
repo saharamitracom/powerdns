@@ -55,6 +55,43 @@ detect_ip() {
     | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}'
 }
 
+# --- port 53 ---------------------------------------------------------------
+# PowerDNS bind ke 0.0.0.0:53, jadi bentrok juga dengan stub 127.0.0.53:53.
+show_port53() {
+  ss -lunp 'sport = :53' 2>/dev/null || true
+  ss -ltnp 'sport = :53' 2>/dev/null || true
+}
+
+free_port53() {
+  local svc pids
+  # Hentikan pdns sendiri dulu supaya tidak bentrok dengan instance lamanya.
+  systemctl stop pdns        >/dev/null 2>&1 || true
+  systemctl reset-failed pdns >/dev/null 2>&1 || true
+
+  for svc in systemd-resolved dnsmasq bind9 named unbound pdns-recursor; do
+    if systemctl is-active --quiet "$svc" 2>/dev/null; then
+      warn "Layanan '$svc' aktif dan memakai port 53 — dinonaktifkan."
+      systemctl disable --now "$svc" >/dev/null 2>&1 || true
+    fi
+  done
+  sleep 1
+
+  local busy
+  busy="$(ss -lun 'sport = :53' 2>/dev/null | tail -n +2)"
+  if [ -n "$busy" ]; then
+    warn "Port 53/UDP masih dipakai:"
+    show_port53
+    pids="$(ss -lunp 'sport = :53' 2>/dev/null | grep -oE 'pid=[0-9]+' \
+            | cut -d= -f2 | sort -u | tr '\n' ' ')"
+    if [ -n "$pids" ]; then
+      warn "PID pemakai: $pids"
+      ps -o pid,ppid,user,cmd -p $pids 2>/dev/null || true
+    fi
+    return 1
+  fi
+  return 0
+}
+
 # ask VAR "Pertanyaan" "default" validator
 ask() {
   local __var="$1" prompt="$2" def="${3:-}" fn="${4:-}" val=""
@@ -159,8 +196,13 @@ apt-get "${APT_OPTS[@]}" install \
 
 #------------------------------------------ bebaskan port 53 SEBELUM install --
 info "Menonaktifkan systemd-resolved (membebaskan port 53)..."
-if systemctl list-unit-files | grep -q '^systemd-resolved\.service'; then
-  systemctl disable --now systemd-resolved || true
+# CATATAN: jangan pakai `systemctl ... | grep -q` di sini. Di bawah
+# `set -o pipefail`, grep -q keluar lebih dulu, systemd-resolved kena SIGPIPE
+# (exit 141), dan seluruh pipeline dianggap gagal -> disable tidak pernah jalan.
+systemctl disable --now systemd-resolved >/dev/null 2>&1 || true
+systemctl stop         systemd-resolved >/dev/null 2>&1 || true
+if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+  warn "systemd-resolved masih aktif setelah disable — akan ditangani free_port53()."
 fi
 if [ -e /etc/resolv.conf ]; then
   cp -aL /etc/resolv.conf "/etc/resolv.conf.bak.$STAMP" 2>/dev/null || true
@@ -220,7 +262,7 @@ schema_is_full() {
   fi
 }
 
-if mysql -N -B "$DB_NAME" -e "SHOW TABLES LIKE 'domains';" | grep -q '^domains$'; then
+if [ -n "$(mysql -N -B "$DB_NAME" -e "SHOW TABLES LIKE 'domains';" 2>/dev/null)" ]; then
   info "Skema PowerDNS sudah ada — import dilewati."
 else
   SCHEMA="$(find_schema)"
@@ -234,7 +276,7 @@ else
     mysql "$DB_NAME" < "$SCHEMA"
   fi
 fi
-mysql -N -B "$DB_NAME" -e "SHOW TABLES LIKE 'domains';" | grep -q '^domains$' \
+[ -n "$(mysql -N -B "$DB_NAME" -e "SHOW TABLES LIKE 'domains';" 2>/dev/null)" ] \
   || die "Import skema gagal — tabel 'domains' tidak ada."
 ok "Skema PowerDNS terverifikasi."
 
@@ -283,6 +325,10 @@ for f in /etc/powerdns/pdns.d/pdns.local.gmysql.conf /etc/powerdns/pdns.d/pdns.l
 done
 ok "Konfigurasi PowerDNS ditulis (mode 640)."
 
+info "Memastikan port 53 bebas..."
+free_port53 || die "Port 53 masih dipakai proses di atas. Matikan proses tersebut lalu jalankan ulang script."
+ok "Port 53 bebas."
+
 info "Menjalankan ulang PowerDNS..."
 systemctl enable pdns >/dev/null 2>&1 || true
 if ! systemctl restart pdns; then
@@ -294,7 +340,7 @@ systemctl is-active --quiet pdns || { journalctl -u pdns -n 40 --no-pager; die "
 ok "PowerDNS aktif."
 
 #-------------------------------------------------------------- zona pertama --
-if mysql -N -B "$DB_NAME" -e "SELECT name FROM domains WHERE name='${DOMAIN}';" | grep -q "^${DOMAIN}$"; then
+if [ -n "$(mysql -N -B "$DB_NAME" -e "SELECT name FROM domains WHERE name='${DOMAIN}' LIMIT 1;" 2>/dev/null)" ]; then
   info "Zona ${DOMAIN} sudah ada — pembuatan zona dilewati."
 else
   info "Membuat zona ${DOMAIN} beserta record NS dan glue..."
@@ -319,7 +365,8 @@ else
   } | mysql "$DB_NAME"
 
   pdns_control rediscover >/dev/null 2>&1 || true
-  if dig @127.0.0.1 "$DOMAIN" SOA +short 2>/dev/null | grep -q "$NS1_HOST"; then
+  SOA_OUT="$(dig @127.0.0.1 "$DOMAIN" SOA +short 2>/dev/null || true)"
+  if [ -n "$SOA_OUT" ] && [ "${SOA_OUT#*"$NS1_HOST"}" != "$SOA_OUT" ]; then
     ok "Zona ${DOMAIN} aktif dan menjawab dari 127.0.0.1"
   else
     warn "Zona dibuat tetapi belum menjawab — cek: dig @127.0.0.1 $DOMAIN SOA"
@@ -385,8 +432,9 @@ systemctl enable apache2 >/dev/null 2>&1 || true
 systemctl restart apache2
 ok "Apache aktif (ServerName ${PANEL_HOST})."
 
+PHP_MODS="$(php -m 2>/dev/null || true)"
 for m in intl gettext mbstring pdo_mysql openssl curl; do
-  php -m 2>/dev/null | grep -qix "$m" || warn "Ekstensi PHP '$m' tidak terdeteksi."
+  grep -qix "$m" <<<"$PHP_MODS" || warn "Ekstensi PHP '$m' tidak terdeteksi."
 done
 
 #------------------------------------------------------------------ firewall --
