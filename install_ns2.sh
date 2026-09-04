@@ -191,17 +191,30 @@ SQLEOF
 ok "Database '$DB_NAME' dan user '$DB_USER' siap."
 
 #--------------------------------------------------------- import skema pdns --
+# Direktori schema juga berisi berkas migrasi (mis. 3.4.0_to_4.1.0_schema.mysql.sql).
+# Pola harus dikunci ke nama berkas persis 'schema.mysql.sql', bukan akhirannya saja.
 find_schema() {
   local f=""
-  f="$(dpkg -L pdns-backend-mysql 2>/dev/null | grep -E 'schema\.mysql\.sql(\.gz)?$' | head -n1 || true)"
+  f="$(dpkg -L pdns-backend-mysql 2>/dev/null | grep -E '/schema\.mysql\.sql(\.gz)?$' | head -n1 || true)"
   if [ -z "$f" ]; then
     f="$(find /usr/share/pdns-backend-mysql \
               /usr/share/doc/pdns-backend-mysql \
               /usr/share/doc/pdns-server \
               /usr/share/dbconfig-common/data \
-              -name 'schema.mysql.sql*' 2>/dev/null | head -n1 || true)"
+              \( -name 'schema.mysql.sql' -o -name 'schema.mysql.sql.gz' \) \
+              2>/dev/null | head -n1 || true)"
   fi
   printf '%s' "$f"
+}
+
+# Pastikan berkas yang dipilih memang skema awal (membuat tabel), bukan migrasi.
+schema_is_full() {
+  local f="$1"
+  if [[ "$f" == *.gz ]]; then
+    zgrep -qiE 'CREATE TABLE( IF NOT EXISTS)? +.?domains' "$f"
+  else
+    grep  -qiE 'CREATE TABLE( IF NOT EXISTS)? +.?domains' "$f"
+  fi
 }
 
 if mysql -N -B "$DB_NAME" -e "SHOW TABLES LIKE 'domains';" | grep -q '^domains$'; then
@@ -209,6 +222,8 @@ if mysql -N -B "$DB_NAME" -e "SHOW TABLES LIKE 'domains';" | grep -q '^domains$'
 else
   SCHEMA="$(find_schema)"
   [ -n "$SCHEMA" ] || die "schema.mysql.sql tidak ditemukan. Cek: dpkg -L pdns-backend-mysql | grep schema"
+  schema_is_full "$SCHEMA" \
+    || die "Berkas '$SCHEMA' bukan skema awal (tidak memuat CREATE TABLE domains)."
   info "Import skema dari: $SCHEMA"
   if [[ "$SCHEMA" == *.gz ]]; then
     zcat "$SCHEMA" | mysql "$DB_NAME"
