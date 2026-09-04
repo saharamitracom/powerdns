@@ -201,17 +201,45 @@ systemctl stop         systemd-resolved >/dev/null 2>&1 || true
 if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
   warn "systemd-resolved masih aktif setelah disable — akan ditangani free_port53()."
 fi
+# Resolver upstream yang sudah bekerja di server ini — dipakai sebagai cadangan.
+# Di banyak jaringan (termasuk ISP), DNS publik 1.1.1.1/8.8.8.8 diblokir keluar.
+UPSTREAM_NS="$(awk '/^[[:space:]]*nameserver/ && $2 !~ /^127\./ {print $2}' \
+                 /etc/resolv.conf 2>/dev/null | head -2 | tr '\n' ' ')"
+
 if [ -e /etc/resolv.conf ]; then
   cp -aL /etc/resolv.conf "/etc/resolv.conf.bak.$STAMP" 2>/dev/null || true
   rm -f /etc/resolv.conf
 fi
-cat > /etc/resolv.conf <<'RESOLVEOF'
-nameserver 1.1.1.1
-nameserver 8.8.8.8
-options timeout:2 attempts:2
-RESOLVEOF
-chmod 644 /etc/resolv.conf
-ok "Resolver sistem: 1.1.1.1 / 8.8.8.8"
+
+write_resolv() {
+  local ns
+  : > /etc/resolv.conf
+  for ns in "$@"; do printf 'nameserver %s\n' "$ns" >> /etc/resolv.conf; done
+  printf 'options timeout:2 attempts:2\n' >> /etc/resolv.conf
+  chmod 644 /etc/resolv.conf
+}
+dns_works() { getent hosts deb.debian.org >/dev/null 2>&1; }
+current_ns() { awk '/^nameserver/{printf "%s ", $2}' /etc/resolv.conf; }
+
+if [ -n "${RESOLVERS:-}" ]; then
+  # shellcheck disable=SC2086
+  write_resolv $RESOLVERS
+elif [ -n "$UPSTREAM_NS" ]; then
+  # shellcheck disable=SC2086
+  write_resolv $UPSTREAM_NS 1.1.1.1
+else
+  write_resolv 1.1.1.1 8.8.8.8
+fi
+
+if ! dns_works; then
+  warn "Resolver saat ini tidak menjawab — mencoba DNS publik."
+  write_resolv 1.1.1.1 8.8.8.8
+fi
+
+dns_works || die "Resolusi DNS tidak berfungsi (resolver dicoba: $(current_ns)).
+       Jalankan ulang dengan resolver yang benar, contoh:
+         RESOLVERS='10.10.10.1 10.10.10.2' $0"
+ok "Resolver sistem: $(current_ns)"
 
 info "Memasang PowerDNS Authoritative Server..."
 apt-get "${APT_OPTS[@]}" install pdns-server pdns-backend-mysql
